@@ -33,7 +33,9 @@ OmegaConf.register_new_resolver("eval", eval, replace=True)
 
 
 # Generate perturbed observation using FGSM
-def attack_policy_FGSM(batch, policy, key, eps=8/255, device='cuda:0'):
+# This version of PGD only use the final predicted action to compute MSE loss,
+# which is used to perturb the input image(s)
+def attack_policy_FGSM_final_pred_only(batch, policy, key, eps=8/255, device='cuda:0'):
 
     # sample trajectory from training set, and evaluate difference
     batch = copy.deepcopy(batch)
@@ -53,6 +55,50 @@ def attack_policy_FGSM(batch, policy, key, eps=8/255, device='cuda:0'):
     
     criterion = torch.nn.MSELoss()
     loss = criterion(pred_action, gt_action)
+
+    grad = torch.autograd.grad(loss, obs_dict[key], retain_graph=False, create_graph=False)[0]
+
+    perturbed_obs = obs_dict[key] + eps * grad.sign()
+    delta = torch.clamp(
+        perturbed_obs - obs_dict[key],
+        min = -eps, max = eps
+    )
+    # clip to 0-1
+    perturbed_obs = torch.clamp(obs_dict[key] + delta, min=0, max=1)
+
+    return perturbed_obs
+
+
+# Generate perturbed observation using FGSM
+# This version of PGD use the final step MSE and randomly sampled intermediate step MSE,
+# in order to avoid the vanishing gradient problem
+def attack_policy_FGSM_all_steps(batch, policy, key, eps=8/255, attack_steps=3, weight=0.1, device='cuda:0'):
+
+    # sample trajectory from training set, and evaluate difference
+    batch = copy.deepcopy(batch)
+    batch = dict_apply(batch, lambda x: x.to(device, non_blocking=True))
+    # the clean input image
+    obs_dict = batch['obs']
+    obs_dict[key] = obs_dict[key].clone().detach().cuda()
+    # ground truth action
+    gt_action = batch['action'].clone().detach().cuda()
+
+    # actovate img gradient for attack
+    obs_dict[key].requires_grad = True
+
+    # model inference
+    result = policy.predict_action_for_attack(obs_dict, attack_steps)
+    
+    criterion = torch.nn.MSELoss()
+    
+    # Final step MSE
+    pred_action = result['action_pred']
+    loss = criterion(pred_action, gt_action)
+
+    # Intermediate steps MSE
+    intermediate_preds = result['intermediate_preds']
+    for pred in intermediate_preds:
+        loss += weight * criterion(pred, gt_action)
 
     grad = torch.autograd.grad(loss, obs_dict[key], retain_graph=False, create_graph=False)[0]
 
