@@ -224,6 +224,139 @@ class DiffusionEquiUNetCNNEncPolicySE2(BaseImagePolicy):
         }
         return result
 
+    # ========= attack inference  ============
+    def conditional_sample_for_attack(self, 
+            condition_data, condition_mask,
+            local_cond=None, global_cond=None,
+            generator=None, attack_steps=3,
+            # keyword arguments to scheduler.step
+            **kwargs
+            ):
+        model = self.diff
+        scheduler = self.noise_scheduler
+
+        trajectory = torch.randn(
+            size=condition_data.shape, 
+            dtype=condition_data.dtype,
+            device=condition_data.device,
+            generator=generator)
+    
+        # set step values
+        scheduler.set_timesteps(self.num_inference_steps)
+
+        # randomly sample intermediate steps to record
+        sampled_steps = torch.randint(low=0, high=scheduler.timesteps, size=(attack_steps,))
+        sampled_trajectories = []
+
+        for t in scheduler.timesteps:
+            # 1. apply conditioning
+            trajectory[condition_mask] = condition_data[condition_mask]
+
+            # 2. predict model output
+            model_output = model(trajectory, t, 
+                local_cond=local_cond, global_cond=global_cond)
+
+            # 3. compute previous image: x_t -> x_t-1
+            trajectory = scheduler.step(
+                model_output, t, trajectory, 
+                generator=generator,
+                **kwargs
+                ).prev_sample
+
+            if t in sampled_steps:
+                trajectory_to_save = trajectory.clone()
+                trajectory_to_save[condition_mask] = condition_data[condition_mask] 
+                sampled_trajectories.append(trajectory_to_save)
+        
+        # finally make sure conditioning is enforced
+        trajectory[condition_mask] = condition_data[condition_mask]        
+
+        return trajectory, sampled_trajectories
+
+
+    def predict_action_for_attack(self, obs_dict: Dict[str, torch.Tensor], attack_steps: int) -> Dict[str, torch.Tensor]:
+        """
+        obs_dict: must include "obs" key
+        result: must include "action" key
+        """
+        assert 'past_action' not in obs_dict # not implemented yet
+        # normalize input
+        nobs = self.normalizer.normalize(obs_dict)
+        value = next(iter(nobs.values()))
+        B, To = value.shape[:2]
+        T = self.horizon
+        Da = self.action_dim
+        To = self.n_obs_steps
+
+        # build input
+        device = self.device
+        dtype = self.dtype
+
+        nobs_features = self.enc(nobs)
+        # reshape back to B, Do
+        global_cond = nobs_features.reshape(B, -1)
+        # empty data for action
+        cond_data = torch.zeros(size=(B, T, Da), device=device, dtype=dtype)
+        cond_mask = torch.zeros_like(cond_data, dtype=torch.bool)
+
+        # run sampling
+        nsample, sampled_trajectories = self.conditional_sample_for_attack(
+            cond_data, 
+            cond_mask,
+            local_cond=None,
+            global_cond=global_cond,
+            attack_steps=attack_steps,
+            **self.kwargs)
+        
+        # unnormalize prediction
+        naction_pred = nsample[...,:Da]
+
+        cos = naction_pred[:, :, 3:4]
+        sin = naction_pred[:, :, 4:5]
+
+        naction_pred = torch.cat((naction_pred[:, :, :3], cos, -sin, torch.zeros_like(cos), sin, cos, torch.zeros_like(cos), naction_pred[:, :, 5:]), dim=2)
+
+        action_pred = self.normalizer['action'].unnormalize(naction_pred)
+        abs_6d = self.getAbsolute6D(action_pred[:, :, 3:9])
+        action_pred[:, :, 3:9] = abs_6d
+
+        # unnormalize intermediate predictions
+        for i in range(len(sampled_trajectories)):
+
+            intermediate_nsample = sampled_trajectories[i]
+            intermediate_naction_pred = intermediate_nsample[...,:Da]
+
+            cos = intermediate_naction_pred[:, :, 3:4]
+            sin = intermediate_naction_pred[:, :, 4:5]
+
+            intermediate_naction_pred = torch.cat((
+                intermediate_naction_pred[:, :, :3], 
+                cos, -sin, 
+                torch.zeros_like(cos), 
+                sin, cos, 
+                torch.zeros_like(cos), 
+                intermediate_naction_pred[:, :, 5:]), 
+                dim=2
+            )
+
+            intermediate_action_pred = self.normalizer['action'].unnormalize(intermediate_naction_pred)
+            abs_6d = self.getAbsolute6D(intermediate_action_pred[:, :, 3:9])
+            intermediate_action_pred[:, :, 3:9] = abs_6d
+
+            sampled_trajectories[i] = intermediate_action_pred
+
+        # get action
+        start = To - 1
+        end = start + self.n_action_steps
+        action = action_pred[:,start:end]
+        
+        result = {
+            'action': action,
+            'action_pred': action_pred,
+            'intermediate_preds': sampled_trajectories
+        }
+        return result
+
     # ========= training  ============
     def set_normalizer(self, normalizer: LinearNormalizer):
         self.normalizer.load_state_dict(normalizer.state_dict())
